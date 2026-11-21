@@ -18,9 +18,9 @@ local checks. The last command requires Terraform.
 GoReleaser packages protocol 6 binaries and computes SHA-256 checksums
 for the archives and Registry manifest. Run `goreleaser check` to validate
 its configuration or `goreleaser release --snapshot --clean` to build
-local packages in `dist/`. The manual Publish workflow creates an unsigned
-GitHub Release. See the [release preparation guide](docs/release.md) for
-signing and Terraform Registry publication.
+local packages in `dist/`. The manual Publish workflow creates a GitHub
+Release with signed checksums. See the [release preparation guide](docs/release.md)
+for signing and Terraform Registry publication.
 
 See [integration testing](integration/README.md) for the disposable Incus
 fixture.
