@@ -76,6 +76,47 @@ jobs:
         with:
           name: terraform-provider-k3s-packages
           path: release
+      - name: Sign and verify release checksums
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          SIGNING_FINGERPRINT: 76963B622D6FE389EB3F1C94EDEF61DC66116445
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          let key = $env.GPG_PRIVATE_KEY
+          let passphrase = $env.GPG_PASSPHRASE
+          hide-env GPG_PRIVATE_KEY GPG_PASSPHRASE
+          if ($key | is-empty) or ($passphrase | is-empty) {
+            error make {msg: "Release signing credentials are missing"}
+          }
+
+          let fingerprint = $env.SIGNING_FINGERPRINT
+          let checksum = $"terraform-provider-k3s_($env.RELEASE_VERSION)_SHA256SUMS"
+          cd release
+          ^sha256sum --strict -c $checksum
+
+          let keyring = (^mktemp -d | str trim)
+          let failure = (try {
+            let imported = ($key | ^gpg --no-options --homedir $keyring --batch --import | complete)
+            if $imported.exit_code != 0 { error make {msg: "Could not import the release signing key"} }
+
+            let signature = $"($checksum).sig"
+            let signed = ($passphrase | ^gpg --no-options --homedir $keyring --batch --pinentry-mode loopback --passphrase-fd 0 --local-user $fingerprint --no-armor --detach-sign --output $signature $checksum | complete)
+            if $signed.exit_code != 0 { error make {msg: "Could not sign with the configured release fingerprint"} }
+
+            let verified = (^gpg --no-options --homedir $keyring --batch --status-fd 1 --verify $signature $checksum | complete)
+            let matches = ($verified.stdout | lines | any {|line|
+              let fields = ($line | split row ' ')
+              ($fields | first 2) == ['[GNUPG:]' VALIDSIG] and (($fields | last) == $fingerprint)
+            })
+            if $verified.exit_code != 0 or not $matches {
+              error make {msg: "The checksum signature failed fingerprint verification"}
+            }
+            null
+          } catch {|err| $err.msg })
+          ^gpgconf --homedir $keyring --kill gpg-agent | complete | ignore
+          rm -rf $keyring
+          if $failure != null { error make {msg: $failure} }
       - name: Publish release and tag the built commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -91,6 +132,8 @@ jobs:
           if $releases.exit_code != 0 { error make {msg: "Could not check for an existing release or draft"} }
           if $tag in ($releases.stdout | lines) { error make {msg: $"A release or draft for ($tag) already exists"} }
 
-          let files = (glob $"($prefix)_*.zip" | append [$"($prefix)_manifest.json" $"($prefix)_SHA256SUMS"])
+          let signature = $"($prefix)_SHA256SUMS.sig"
+          if not ($signature | path exists) { error make {msg: "The verified checksum signature is missing"} }
+          let files = (glob $"($prefix)_*.zip" | append [$"($prefix)_manifest.json" $"($prefix)_SHA256SUMS" $signature])
           ^gh api --method POST $"repos/($repo)/git/refs" -f $"ref=refs/tags/($tag)" -f $"sha=($env.GITHUB_SHA)"
           ^gh release create $tag ...$files --repo $repo --verify-tag --title $tag --generate-notes
