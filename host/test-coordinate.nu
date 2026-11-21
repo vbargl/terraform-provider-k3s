@@ -34,8 +34,18 @@ def main [] {
     fixture {|req, root, data|
         let bootstrap = ($req | merge {role: bootstrap, endpoint: "", cluster_uid: "", token: ""})
         handle $bootstrap $root $data machine {|args, input| } | ignore
-        let retry = (try { handle $bootstrap $root $data machine {|args, input| "unexpected" } } catch { null })
-        assert equal $retry null
+        assert (not (open ($root | path join intent.json) | get started? | default false))
+        check-service-start $root $data
+        assert (open ($root | path join intent.json) | get started)
+        assert error { check-service-start $root $data }
+        let pending = (handle $bootstrap $root $data machine {|args, input|
+            assert equal $args [systemctl show --property=ActiveState --value k3s.service]
+            "activating"
+        })
+        assert equal $pending.machine_id "machine"
+        assert error { handle $bootstrap $root $data machine {|args, input| "inactive" } }
+        mkdir ($data | path join server db etcd)
+        check-service-start $root $data
     }
     fixture {|req, root, data|
         mkdir $data

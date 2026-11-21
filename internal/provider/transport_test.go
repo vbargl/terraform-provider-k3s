@@ -61,7 +61,7 @@ func startSSHAgent(t *testing.T, keys ...ed25519.PrivateKey) {
 	t.Setenv("SSH_AUTH_SOCK", socket)
 }
 
-func startSSHHost(t *testing.T, host, client ssh.Signer, reply string, exitCode uint32) (string, <-chan request) {
+func startSSHHost(t *testing.T, host, client ssh.Signer, reply string, exitCode uint32, stall ...bool) (string, <-chan request) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -120,6 +120,10 @@ func startSSHHost(t *testing.T, host, client ssh.Signer, reply string, exitCode 
 			return
 		}
 		received <- req
+		if len(stall) > 0 && stall[0] {
+			_ = server.Wait()
+			return
+		}
 		_, _ = stream.Stderr().Write([]byte("untrusted test stderr"))
 		_, _ = stream.Write([]byte(reply))
 		status := make([]byte, 4)
@@ -145,6 +149,7 @@ func TestSSHTransport(t *testing.T) {
 		{"missing client key", pin, testPin, "{}", "selected SSH identity is absent", 0},
 		{"invalid JSON", pin, identity, "untrusted test payload", "invalid response", 0},
 		{"oversize", pin, identity, strings.Repeat("x", protocolLimit+1), "exceeded protocol limit", 0},
+		{"wrong cluster", pin, identity, "{}", "anchor cluster identity mismatch", 78},
 		{"helper refusal", pin, identity, "{}", "host helper rejected", 1},
 		{"lock contention", pin, identity, "{}", "lock is busy", 75},
 	} {
@@ -173,13 +178,17 @@ func TestReconcileJoinRetry(t *testing.T) {
 	n := configuredNode("agent")
 	for _, fresh := range []bool{true, false} {
 		var targetCalls, anchorCalls []string
-		sealAttempts := 0
+		sealAttempts, applyAttempts := 0, 0
 		target := func(_ context.Context, req request) (response, error) {
 			targetCalls = append(targetCalls, req.Operation)
 			switch req.Operation {
 			case "probe":
 				return response{MachineID: "host", NeedsToken: fresh}, nil
 			case "apply":
+				applyAttempts++
+				if !fresh && applyAttempts == 1 {
+					return response{}, &transportError{"test interrupted apply", retryableFailure}
+				}
 				if (req.Token == "test-token") != fresh {
 					t.Fatal("unexpected token transfer")
 				}
@@ -189,7 +198,7 @@ func TestReconcileJoinRetry(t *testing.T) {
 					t.Fatal("seal must carry verified public identities only")
 				}
 				if !fresh && sealAttempts == 1 {
-					return response{}, &transportError{"test disconnection", true}
+					return response{}, &transportError{"test disconnection", retryableFailure}
 				}
 			}
 			return response{MachineID: "host"}, nil
@@ -211,7 +220,7 @@ func TestReconcileJoinRetry(t *testing.T) {
 		}
 		wantTarget := []string{"probe", "apply", "local", "seal"}
 		if !fresh {
-			wantTarget = append(wantTarget, "seal")
+			wantTarget = []string{"probe", "apply", "apply", "local", "seal", "seal"}
 		}
 		if !reflect.DeepEqual(anchorCalls, wantAnchor) || !reflect.DeepEqual(targetCalls, wantTarget) {
 			t.Fatalf("unexpected calls (fresh=%v): %v %v", fresh, anchorCalls, targetCalls)
@@ -223,9 +232,65 @@ func TestAmbiguousTokenRequestIsNotRetried(t *testing.T) {
 	attempts := 0
 	_, err := callWithRetry(context.Background(), func(context.Context, request) (response, error) {
 		attempts++
-		return response{}, &transportError{"test disconnection", true}
+		return response{}, &transportError{"test disconnection", retryableFailure}
 	}, request{Operation: "token"})
 	if err == nil || attempts != 1 {
 		t.Fatalf("expected one attempt and an error, got %d and %v", attempts, err)
 	}
+}
+
+func TestReadinessReturnsPermanentSSHFailure(t *testing.T) {
+	n := configuredNode("bootstrap")
+	target := func(context.Context, request) (response, error) {
+		return response{MachineID: "host"}, nil
+	}
+	pinMismatch := &transportError{"wrong host pin", permanentFailure}
+	anchor := func(context.Context, request) (response, error) {
+		return response{}, pinMismatch
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := reconcileNode(ctx, n, target, anchor); !errors.Is(err, pinMismatch) {
+		t.Fatalf("expected immediate pin failure, got %v", err)
+	}
+}
+
+func TestSSHDeadlines(t *testing.T) {
+	_, host := testKey(t)
+	key, client := testKey(t)
+	startSSHAgent(t, key)
+	pin := ssh.FingerprintSHA256(host.PublicKey())
+	t.Run("stalled handshake", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = listener.Close() }()
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			_, _ = io.Copy(io.Discard, conn)
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		_, err = call(ctx, listener.Addr().String(), "tester", pin, "", request{Operation: "probe", Name: "worker"})
+		if !isFailure(err, retryableFailure) || !strings.Contains(err.Error(), "handshake interrupted or timed out") {
+			t.Fatalf("expected handshake timeout, got %v", err)
+		}
+	})
+	t.Run("stalled command", func(t *testing.T) {
+		address, received := startSSHHost(t, host, client, "", 0, true)
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		_, err := call(ctx, address, "tester", pin, "", request{Operation: "probe", Name: "worker"})
+		if _, ok := <-received; !ok {
+			t.Fatal("SSH command did not reach the test host")
+		}
+		if !isFailure(err, retryableFailure) || !strings.Contains(err.Error(), "operation timed out or was canceled") {
+			t.Fatalf("expected stalled command to hit the deadline, got %v", err)
+		}
+	})
 }

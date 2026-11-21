@@ -34,7 +34,10 @@ def unmanaged-data [data: string] {
 
 def cluster-operation [req: record, data: string, runner: closure] {
     let cluster = (kubectl $runner [get namespace kube-system -o json] | from json | get metadata.uid)
-    if ($req.cluster_uid != "" and $cluster != $req.cluster_uid) or ($req.operation != "observe" and $req.cluster_uid == "") { fail-operation }
+    if $req.cluster_uid != "" and $cluster != $req.cluster_uid {
+        error make {msg: "K3s cluster identity mismatch"}
+    }
+    if $req.operation != "observe" and $req.cluster_uid == "" { fail-operation }
     let raw = (kubectl $runner [get node $req.name "--ignore-not-found" -o json])
     let node = if ($raw | is-empty) { null } else { $raw | from json }
     let target = ($req.machine_id? | default "")
@@ -142,7 +145,13 @@ export def handle [req: record, root: string, data: string, machine_id: string, 
     if $stopped or ($current.uid != "" and ($data | path type) != "dir") { fail-operation }
     let started = ($current.started? | default false)
     let bootstrap = ($req.role == "bootstrap")
-    if ($req.role != "agent") and ($started or $current.uid != "") and ([$data server db etcd] | path join | path type) != "dir" { fail-operation }
+    if ($req.role != "agent") and ($started or $current.uid != "") and ([$data server db etcd] | path join | path type) != "dir" {
+        if $bootstrap and $current.uid == "" {
+            let state = (do $runner [systemctl show --property=ActiveState --value $unit] "" | str trim)
+            if $state in [active activating] { return {machine_id: $machine_id} }
+        }
+        fail-operation
+    }
     let action = if not $bootstrap and $token != "" and ($token_file | path exists) and ((open --raw $token_file | str trim) != $token) { "restart" } else { "start" }
     let options = if $bootstrap {
         {node-name: $req.name, cluster-init: true}
@@ -154,18 +163,20 @@ export def handle [req: record, root: string, data: string, machine_id: string, 
         {node-name: $req.name, server: $req.endpoint, token-file: $token_file}
     }
     save-private $root $config ($options | to json --raw)
-    if $bootstrap and not $started {
-        save-private $root $marker ($current | upsert started true | to json --raw)
-    }
     do $runner [systemctl --no-block $action $unit] "" | ignore
     {machine_id: $machine_id}
 }
 
 export def check-service-start [root: string, data: string] {
-    let current = (open ([$root intent.json] | path join))
+    let marker = ([$root intent.json] | path join)
+    let current = (open $marker)
     if ($current.stopped? | default false) or ([$root k3s.yaml] | path join | path type) != "file" { fail-operation }
     if $current.uid != "" and ($data | path type) != "dir" { fail-operation }
-    if $current.uid != "" and $current.role != "agent" and ([$data server db etcd] | path join | path type) != "dir" { fail-operation }
+    let started = ($current.started? | default false)
+    if $current.role != "agent" and ($started or $current.uid != "") and ([$data server db etcd] | path join | path type) != "dir" { fail-operation }
+    if $current.role == "bootstrap" and not $started {
+        save-private $root $marker ($current | upsert started true | to json --raw)
+    }
 }
 
 def main [--check-service-start, --locked] {
@@ -175,7 +186,7 @@ def main [--check-service-start, --locked] {
     let data = "/var/lib/rancher/k3s"
     try {
         if ($payload | bytes length) > 8192 { fail-operation }
-        if $check_service_start {
+        if $locked and $check_service_start {
             check-service-start $root $data
         } else if $locked {
             let machine = (open --raw /etc/machine-id | str trim)
@@ -184,9 +195,9 @@ def main [--check-service-start, --locked] {
             ^install -d -m 0700 -- $root
             let lock = ([$root lock] | path join)
             let script = $env.CURRENT_FILE
-            let request = ($payload | decode utf-8 | from json)
-            let child = [env -i "PATH=/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin" $nu.current-exe --no-config-file --stdin $script --locked]
-            let result = if $request.operation in [observe token remove] {
+            let operation = if $check_service_start { "" } else { $payload | decode utf-8 | from json | get operation }
+            let child = ([env -i "PATH=/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin" $nu.current-exe --no-config-file --stdin $script --locked] | append (if $check_service_start { ["--check-service-start"] } else { [] }))
+            let result = if $operation in [observe token remove] {
                 $payload | ^timeout --kill-after=5 50 ...$child | complete
             } else {
                 $payload | ^timeout --kill-after=5 55 flock -w 5 -E 75 -x -- $lock ...$child | complete
@@ -195,6 +206,10 @@ def main [--check-service-start, --locked] {
                 print --stderr "K3s host operation timed out or lock is busy"
                 exit 75
             }
+            if $result.exit_code == 78 {
+                print --stderr "K3s cluster identity mismatch"
+                exit 78
+            }
             if $result.exit_code != 0 { fail-operation }
             print --no-newline $result.stdout
         }
@@ -202,6 +217,10 @@ def main [--check-service-start, --locked] {
         if $err.msg == "K3s service stop still pending" {
             print --stderr "K3s service stop still pending"
             exit 75
+        }
+        if $err.msg == "K3s cluster identity mismatch" {
+            print --stderr "K3s cluster identity mismatch"
+            exit 78
         }
         print --stderr "K3s host operation failed"
         exit 1

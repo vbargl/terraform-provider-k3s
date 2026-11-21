@@ -30,7 +30,9 @@ intended role. Its ExecStart must use the correct K3s subcommand and
 `ConditionPathExists=/var/lib/k3s-coordinate/k3s.yaml` under Unit and leave
 initial start to the provider. Add
 `ExecCondition=/usr/local/sbin/k3s-coordinate --check-service-start` under
-Service to block restarts if recorded bootstrap data has disappeared.
+Service. It records the initial bootstrap under the intent lock before
+K3s starts and blocks subsequent starts if etcd data is missing. A repeated
+apply can observe the existing startup while systemd is activating K3s.
 Use the distro's standard K3s systemd
 settings for restart, mount preparation, delegation and limits. Additional
 OS-owned K3s configuration must be compatible and must not override node

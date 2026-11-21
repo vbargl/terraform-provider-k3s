@@ -25,7 +25,7 @@ jobs:
       - uses: hustcer/setup-nu@1b8faed9a8ff673c8ce0beae243e0b72d0787241 # v3
         with:
           version: "0.116.1"
-      - run: ^go test ./...
+      - run: ^go test -race ./...
       - run: ^nu --no-config-file host/test-coordinate.nu
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:

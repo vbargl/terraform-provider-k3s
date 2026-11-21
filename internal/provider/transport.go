@@ -48,19 +48,32 @@ func (b *responseBuffer) Write(p []byte) (int, error) {
 	return b.buffer.Write(p)
 }
 
+type failureKind uint8
+
+const (
+	permanentFailure failureKind = iota
+	retryableFailure
+	helperRejected
+)
+
 type transportError struct {
-	message   string
-	transient bool
+	message string
+	kind    failureKind
+}
+
+func isFailure(err error, kind failureKind) bool {
+	var failure *transportError
+	return errors.As(err, &failure) && failure.kind == kind
 }
 
 func (e *transportError) Error() string { return e.message }
 
 func call(ctx context.Context, host, user, pin, identity string, req request) (response, error) {
-	failure := func(reason string, transient bool) (response, error) {
-		return response{}, &transportError{fmt.Sprintf("host operation %q failed for node %q: %s", req.Operation, req.Name, reason), transient}
+	failure := func(reason string, kind failureKind) (response, error) {
+		return response{}, &transportError{fmt.Sprintf("host operation %q failed for node %q: %s", req.Operation, req.Name, reason), kind}
 	}
 	if !validPin(pin) {
-		return failure("invalid SSH host fingerprint", false)
+		return failure("invalid SSH host fingerprint", permanentFailure)
 	}
 	const setupTimeout = 20 * time.Second
 	const commandTimeout = 65 * time.Second
@@ -72,13 +85,13 @@ func call(ctx context.Context, host, user, pin, identity string, req request) (r
 	dialer := net.Dialer{Timeout: 10 * time.Second}
 	socket, err := dialer.DialContext(setup, "unix", os.Getenv("SSH_AUTH_SOCK"))
 	if err != nil {
-		return failure("an accessible SSH agent is required", false)
+		return failure("an accessible SSH agent is required", permanentFailure)
 	}
 	defer func() { _ = socket.Close() }()
 	_ = socket.SetDeadline(setupDeadline)
 	signers, err := agent.NewClient(socket).Signers()
 	if err != nil {
-		return failure("could not read SSH agent keys", false)
+		return failure("could not read SSH agent keys", permanentFailure)
 	}
 	if identity != "" {
 		for _, signer := range signers {
@@ -88,15 +101,15 @@ func call(ctx context.Context, host, user, pin, identity string, req request) (r
 			}
 		}
 		if len(signers) != 1 || ssh.FingerprintSHA256(signers[0].PublicKey()) != identity {
-			return failure("selected SSH identity is absent from the agent", false)
+			return failure("selected SSH identity is absent from the agent", permanentFailure)
 		}
 	}
 	if len(signers) == 0 {
-		return failure("the SSH agent has no keys", false)
+		return failure("the SSH agent has no keys", permanentFailure)
 	}
 	conn, err := dialer.DialContext(setup, "tcp", host)
 	if err != nil {
-		return failure("SSH connection unavailable", true)
+		return failure("SSH connection unavailable", retryableFailure)
 	}
 	defer func() { _ = conn.Close() }()
 	stop := context.AfterFunc(ctx, func() {
@@ -123,11 +136,11 @@ func call(ctx context.Context, host, user, pin, identity string, req request) (r
 		var network net.Error
 		switch {
 		case pinMismatch:
-			return failure("SSH host key mismatch", false)
+			return failure("SSH host key mismatch", permanentFailure)
 		case ctx.Err() != nil || errors.Is(err, io.EOF) || errors.As(err, &network):
-			return failure("SSH handshake interrupted or timed out", true)
+			return failure("SSH handshake interrupted or timed out", retryableFailure)
 		default:
-			return failure("SSH authentication or security negotiation failed", false)
+			return failure("SSH authentication or security negotiation failed", permanentFailure)
 		}
 	}
 	_ = conn.SetDeadline(time.Now().Add(commandTimeout))
@@ -135,12 +148,12 @@ func call(ctx context.Context, host, user, pin, identity string, req request) (r
 	defer func() { _ = client.Close() }()
 	session, err := client.NewSession()
 	if err != nil {
-		return failure("SSH session unavailable", true)
+		return failure("SSH session unavailable", retryableFailure)
 	}
 	defer func() { _ = session.Close() }()
 	payload, err := json.Marshal(req)
 	if err != nil || len(payload) > protocolLimit {
-		return failure("invalid host request", false)
+		return failure("invalid host request", permanentFailure)
 	}
 	session.Stdin = bytes.NewReader(payload)
 	var output responseBuffer
@@ -149,20 +162,22 @@ func call(ctx context.Context, host, user, pin, identity string, req request) (r
 		var remote *ssh.ExitError
 		switch {
 		case ctx.Err() != nil:
-			return failure("SSH operation timed out or was canceled", true)
+			return failure("SSH operation timed out or was canceled", retryableFailure)
 		case errors.Is(err, errResponseLimit):
-			return failure(errResponseLimit.Error(), false)
+			return failure(errResponseLimit.Error(), permanentFailure)
 		case errors.As(err, &remote) && remote.ExitStatus() == 75:
-			return failure("host operation timed out or lock is busy", true)
+			return failure("host operation timed out or lock is busy", retryableFailure)
+		case errors.As(err, &remote) && remote.ExitStatus() == 78:
+			return failure("anchor cluster identity mismatch", permanentFailure)
 		case errors.As(err, &remote):
-			return failure("host helper rejected the operation", false)
+			return failure("host helper rejected the operation", helperRejected)
 		default:
-			return failure("SSH session ended without a response", true)
+			return failure("SSH session ended without a response", retryableFailure)
 		}
 	}
 	var result response
 	if !bytes.HasPrefix(bytes.TrimSpace(output.buffer.Bytes()), []byte("{")) || json.Unmarshal(output.buffer.Bytes(), &result) != nil {
-		return failure("host helper returned an invalid response", false)
+		return failure("host helper returned an invalid response", permanentFailure)
 	}
 	return result, nil
 }
@@ -172,9 +187,8 @@ type hostCall func(context.Context, request) (response, error)
 func callWithRetry(ctx context.Context, operation hostCall, req request) (response, error) {
 	for attempt := 0; ; attempt++ {
 		result, err := operation(ctx, req)
-		var transport *transportError
 		// Token creation is not idempotent after an ambiguous disconnection.
-		if req.Operation == "token" || attempt == 2 || !errors.As(err, &transport) || !transport.transient {
+		if req.Operation == "token" || attempt == 2 || !isFailure(err, retryableFailure) {
 			return result, err
 		}
 		timer := time.NewTimer(time.Duration(1<<attempt) * time.Second)
@@ -254,10 +268,22 @@ func reconcileNode(ctx context.Context, n node, target, anchor hostCall) (respon
 	defer cancel()
 	for {
 		result, err := anchor(wait, observation)
+		if isFailure(err, permanentFailure) {
+			return response{}, err
+		}
+		if req.ClusterUID != "" && result.ClusterUID != "" && result.ClusterUID != req.ClusterUID {
+			return response{}, errors.New("anchor cluster identity mismatch")
+		}
+		if req.UID != "" && result.UID != "" && result.UID != req.UID {
+			return response{}, errors.New("the cluster reports a different node UID")
+		}
 		if err == nil && result.Ready && result.UID != "" && result.ClusterUID != "" &&
 			(req.ClusterUID == "" || result.ClusterUID == req.ClusterUID) &&
 			(req.UID == "" || result.UID == req.UID) {
 			active, localErr := target(wait, n.request("local"))
+			if isFailure(localErr, permanentFailure) {
+				return response{}, localErr
+			}
 			if localErr == nil && active.MachineID == observation.MachineID {
 				seal := n.request("seal")
 				seal.ClusterUID, seal.UID = result.ClusterUID, result.UID

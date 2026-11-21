@@ -31,6 +31,9 @@ func validAddress(value string) bool {
 }
 
 func validEndpoint(value string) bool {
+	if !strings.HasPrefix(value, "https://") {
+		return false
+	}
 	u, err := url.Parse(value)
 	return err == nil && u.Scheme == "https" && u.Hostname() != "" && u.User == nil &&
 		!strings.HasSuffix(u.Host, ":") && u.Path == "" && u.RawQuery == "" && !u.ForceQuery && !strings.Contains(value, "#") &&

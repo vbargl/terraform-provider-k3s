@@ -42,6 +42,7 @@ func TestValidateNode(t *testing.T) {
 		{"host port", func(n *node) { n.Host = types.StringValue("test.example") }},
 		{"missing anchor", func(n *node) { n.Anchor = types.StringNull() }},
 		{"malformed pin", func(n *node) { n.Pin = types.StringValue("SHA256:bad") }},
+		{"uppercase URL scheme", func(n *node) { n.Endpoint = types.StringValue("HTTPS://test.example") }},
 		{"URL query", func(n *node) { n.Endpoint = types.StringValue("https://test.example?") }},
 		{"URL credentials", func(n *node) { n.Endpoint = types.StringValue("https://user@test.example") }},
 		{"timeout", func(n *node) { n.Timeout = types.Int64Value(10) }},
