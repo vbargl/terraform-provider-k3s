@@ -1,0 +1,35 @@
+name: Check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: nu --no-config-file {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.15.0
+      - uses: hustcer/setup-nu@v3
+        with:
+          version: "0.116.1"
+      - run: ^go test ./...
+      - run: ^nu --no-config-file host/test-coordinate.nu
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.17.1"
+          terraform_wrapper: false
+      - run: ^terraform fmt -check -recursive
+      - run: ^nu --no-config-file tests/run-native.nu

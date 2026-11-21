@@ -1,0 +1,7 @@
+/terraform-provider-k3s
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+
+/dist/
