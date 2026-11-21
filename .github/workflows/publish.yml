@@ -47,7 +47,7 @@ jobs:
           let prefix = $"terraform-provider-k3s_($env.RELEASE_VERSION)"
           cp terraform-registry-manifest.json $"dist/($prefix)_manifest.json"
           cd dist
-          ^sha256sum -c $"($prefix)_SHA256SUMS"
+          ^sha256sum --strict -c $"($prefix)_SHA256SUMS"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: terraform-provider-k3s-packages
@@ -87,12 +87,10 @@ jobs:
           cd release
           ^sha256sum --strict -c $"($prefix)_SHA256SUMS"
 
-          let remote = $"($env.GITHUB_SERVER_URL)/($repo).git"
-          let tag_check = (^git ls-remote --exit-code --refs $remote $"refs/tags/($tag)" | complete)
-          if $tag_check.exit_code == 0 { error make {msg: $"Tag ($tag) already exists"} }
-          if $tag_check.exit_code != 2 { error make {msg: "Could not check for an existing tag"} }
-          let releases = (^gh api --paginate $"repos/($repo)/releases" --jq '.[].tag_name' | lines)
-          if $tag in $releases { error make {msg: $"A release or draft for ($tag) already exists"} }
+          let releases = (^gh api --paginate $"repos/($repo)/releases" --jq '.[].tag_name' | complete)
+          if $releases.exit_code != 0 { error make {msg: "Could not check for an existing release or draft"} }
+          if $tag in ($releases.stdout | lines) { error make {msg: $"A release or draft for ($tag) already exists"} }
 
-          let files = (glob "*.zip" | append [$"($prefix)_manifest.json" $"($prefix)_SHA256SUMS"])
-          ^gh release create $tag ...$files --repo $repo --target $env.GITHUB_SHA --title $tag --generate-notes
+          let files = (glob $"($prefix)_*.zip" | append [$"($prefix)_manifest.json" $"($prefix)_SHA256SUMS"])
+          ^gh api --method POST $"repos/($repo)/git/refs" -f $"ref=refs/tags/($tag)" -f $"sha=($env.GITHUB_SHA)"
+          ^gh release create $tag ...$files --repo $repo --verify-tag --title $tag --generate-notes
