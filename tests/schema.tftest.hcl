@@ -1,8 +1,6 @@
-mock_provider "k3s" {}
-
 variables {
   bootstrap_host = "192.0.2.10:22"
-  bootstrap_pin  = "SHA256:bootstrap"
+  bootstrap_pin  = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 }
 
 run "plan_bootstrap" {

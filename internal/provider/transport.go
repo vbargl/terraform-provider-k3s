@@ -6,10 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math/rand/v2"
 	"net"
-	"net/url"
 	"os"
-	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -32,34 +32,71 @@ type response struct {
 	Ready      bool   `json:"ready"`
 	Token      string `json:"token"`
 	MachineID  string `json:"machine_id"`
+	NeedsToken bool   `json:"needs_token"`
 }
+
+const protocolLimit = 8192
+
+var errResponseLimit = errors.New("host response exceeded protocol limit")
 
 type responseBuffer struct{ buffer bytes.Buffer }
 
 func (b *responseBuffer) Write(p []byte) (int, error) {
-	if b.buffer.Len()+len(p) > 8192 {
-		return 0, errors.New("host response exceeded protocol limit")
+	if b.buffer.Len()+len(p) > protocolLimit {
+		return 0, errResponseLimit
 	}
 	return b.buffer.Write(p)
 }
 
-func call(ctx context.Context, host, user, pin string, req request) (response, error) {
-	var result response
-	failure := fmt.Errorf("host operation %q failed for node %q", req.Operation, req.Name)
-	if !strings.HasPrefix(pin, "SHA256:") {
-		return result, failure
+type transportError struct {
+	message   string
+	transient bool
+}
+
+func (e *transportError) Error() string { return e.message }
+
+func call(ctx context.Context, host, user, pin, identity string, req request) (response, error) {
+	failure := func(reason string, transient bool) (response, error) {
+		return response{}, &transportError{fmt.Sprintf("host operation %q failed for node %q: %s", req.Operation, req.Name, reason), transient}
 	}
-	ctx, cancel := context.WithTimeout(ctx, 40*time.Second)
+	if !validPin(pin) {
+		return failure("invalid SSH host fingerprint", false)
+	}
+	const setupTimeout = 20 * time.Second
+	const commandTimeout = 65 * time.Second
+	ctx, cancel := context.WithTimeout(ctx, setupTimeout+commandTimeout)
 	defer cancel()
-	dialer := net.Dialer{}
-	socket, err := dialer.DialContext(ctx, "unix", os.Getenv("SSH_AUTH_SOCK"))
+	setup, cancelSetup := context.WithTimeout(ctx, setupTimeout)
+	defer cancelSetup()
+	setupDeadline, _ := setup.Deadline()
+	dialer := net.Dialer{Timeout: 10 * time.Second}
+	socket, err := dialer.DialContext(setup, "unix", os.Getenv("SSH_AUTH_SOCK"))
 	if err != nil {
-		return result, errors.New("an accessible SSH agent is required")
+		return failure("an accessible SSH agent is required", false)
 	}
 	defer func() { _ = socket.Close() }()
-	conn, err := dialer.DialContext(ctx, "tcp", host)
+	_ = socket.SetDeadline(setupDeadline)
+	signers, err := agent.NewClient(socket).Signers()
 	if err != nil {
-		return result, failure
+		return failure("could not read SSH agent keys", false)
+	}
+	if identity != "" {
+		for _, signer := range signers {
+			if ssh.FingerprintSHA256(signer.PublicKey()) == identity {
+				signers = []ssh.Signer{signer}
+				break
+			}
+		}
+		if len(signers) != 1 || ssh.FingerprintSHA256(signers[0].PublicKey()) != identity {
+			return failure("selected SSH identity is absent from the agent", false)
+		}
+	}
+	if len(signers) == 0 {
+		return failure("the SSH agent has no keys", false)
+	}
+	conn, err := dialer.DialContext(setup, "tcp", host)
+	if err != nil {
+		return failure("SSH connection unavailable", true)
 	}
 	defer func() { _ = conn.Close() }()
 	stop := context.AfterFunc(ctx, func() {
@@ -67,39 +104,87 @@ func call(ctx context.Context, host, user, pin string, req request) (response, e
 		_ = socket.Close()
 	})
 	defer stop()
+	pinMismatch := false
 	config := &ssh.ClientConfig{
 		HostKeyAlgorithms: []string{ssh.KeyAlgoED25519},
 		User:              user,
-		Auth:              []ssh.AuthMethod{ssh.PublicKeysCallback(agent.NewClient(socket).Signers)},
+		Auth:              []ssh.AuthMethod{ssh.PublicKeys(signers...)},
 		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
 			if ssh.FingerprintSHA256(key) != pin {
+				pinMismatch = true
 				return errors.New("host key mismatch")
 			}
 			return nil
 		},
 	}
+	_ = conn.SetDeadline(setupDeadline)
 	c, channels, requests, err := ssh.NewClientConn(conn, host, config)
 	if err != nil {
-		return result, failure
+		var network net.Error
+		switch {
+		case pinMismatch:
+			return failure("SSH host key mismatch", false)
+		case ctx.Err() != nil || errors.Is(err, io.EOF) || errors.As(err, &network):
+			return failure("SSH handshake interrupted or timed out", true)
+		default:
+			return failure("SSH authentication or security negotiation failed", false)
+		}
 	}
+	_ = conn.SetDeadline(time.Now().Add(commandTimeout))
 	client := ssh.NewClient(c, channels, requests)
 	defer func() { _ = client.Close() }()
 	session, err := client.NewSession()
 	if err != nil {
-		return result, failure
+		return failure("SSH session unavailable", true)
 	}
 	defer func() { _ = session.Close() }()
 	payload, err := json.Marshal(req)
-	if err != nil {
-		return result, failure
+	if err != nil || len(payload) > protocolLimit {
+		return failure("invalid host request", false)
 	}
 	session.Stdin = bytes.NewReader(payload)
 	var output responseBuffer
 	session.Stdout = &output
-	if err := session.Run("k3s-coordinate"); err != nil || json.Unmarshal(output.buffer.Bytes(), &result) != nil {
-		return response{}, failure
+	if err := session.Run("k3s-coordinate"); err != nil {
+		var remote *ssh.ExitError
+		switch {
+		case ctx.Err() != nil:
+			return failure("SSH operation timed out or was canceled", true)
+		case errors.Is(err, errResponseLimit):
+			return failure(errResponseLimit.Error(), false)
+		case errors.As(err, &remote) && remote.ExitStatus() == 75:
+			return failure("host operation timed out or lock is busy", true)
+		case errors.As(err, &remote):
+			return failure("host helper rejected the operation", false)
+		default:
+			return failure("SSH session ended without a response", true)
+		}
+	}
+	var result response
+	if !bytes.HasPrefix(bytes.TrimSpace(output.buffer.Bytes()), []byte("{")) || json.Unmarshal(output.buffer.Bytes(), &result) != nil {
+		return failure("host helper returned an invalid response", false)
 	}
 	return result, nil
+}
+
+type hostCall func(context.Context, request) (response, error)
+
+func callWithRetry(ctx context.Context, operation hostCall, req request) (response, error) {
+	for attempt := 0; ; attempt++ {
+		result, err := operation(ctx, req)
+		var transport *transportError
+		// Token creation is not idempotent after an ambiguous disconnection.
+		if req.Operation == "token" || attempt == 2 || !errors.As(err, &transport) || !transport.transient {
+			return result, err
+		}
+		timer := time.NewTimer(time.Duration(1<<attempt) * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return response{}, err
+		case <-timer.C:
+		}
+	}
 }
 
 func (n node) request(op string) request {
@@ -107,13 +192,13 @@ func (n node) request(op string) request {
 		Endpoint: n.Endpoint.ValueString(), ClusterUID: n.ClusterUID.ValueString(), UID: n.ID.ValueString()}
 }
 func (n node) target(ctx context.Context, req request) (response, error) {
-	return call(ctx, n.Host.ValueString(), n.User.ValueString(), n.Pin.ValueString(), req)
+	return call(ctx, n.Host.ValueString(), n.User.ValueString(), n.Pin.ValueString(), n.Identity.ValueString(), req)
 }
 func (n node) anchor(ctx context.Context, req request) (response, error) {
 	if n.Role.ValueString() == "bootstrap" {
 		return n.target(ctx, req)
 	}
-	return call(ctx, n.Anchor.ValueString(), n.User.ValueString(), n.AnchorPin.ValueString(), req)
+	return call(ctx, n.Anchor.ValueString(), n.User.ValueString(), n.AnchorPin.ValueString(), n.Identity.ValueString(), req)
 }
 
 func observe(ctx context.Context, n node) (response, error) {
@@ -127,69 +212,70 @@ func observe(ctx context.Context, n node) (response, error) {
 }
 
 func reconcile(ctx context.Context, n node) (response, error) {
-	req := n.request("apply")
-	if !dnsLabel.MatchString(req.Name) {
-		return response{}, errors.New("name must be a DNS label")
+	if diagnostics := validateNode(n, false); diagnostics.HasError() {
+		return response{}, errors.New(diagnostics.Errors()[0].Detail())
 	}
-	switch req.Role {
-	case "bootstrap":
-		if req.Endpoint != "" || n.Anchor.ValueString() != "" || n.AnchorPin.ValueString() != "" {
-			return response{}, errors.New("bootstrap must omit registration and anchor fields")
+	return reconcileNode(ctx, n, n.target, n.anchor)
+}
+
+func reconcileNode(ctx context.Context, n node, target, anchor hostCall) (response, error) {
+	req := n.request("apply")
+	if req.Role != "bootstrap" && req.UID == "" {
+		probe, err := callWithRetry(ctx, target, n.request("probe"))
+		if err != nil {
+			return response{}, err
 		}
-	case "server", "agent":
-		endpoint, err := url.Parse(req.Endpoint)
-		if err != nil || endpoint.Scheme != "https" || endpoint.Hostname() == "" ||
-			endpoint.User != nil || endpoint.Path != "" || endpoint.RawQuery != "" || endpoint.Fragment != "" ||
-			n.Anchor.ValueString() == "" || n.AnchorPin.ValueString() == "" || req.ClusterUID == "" {
-			return response{}, errors.New("joins require an HTTPS origin, pinned anchor and cluster UID")
+		if probe.MachineID == "" {
+			return response{}, errors.New("target did not report its machine identity")
 		}
-		local, err := n.target(ctx, n.request("local"))
-		if (err != nil || local.UID == "") && req.UID == "" {
-			target, err := n.target(ctx, n.request("probe"))
+		if probe.NeedsToken {
+			tokenRequest := n.request("token")
+			tokenRequest.MachineID = probe.MachineID
+			token, err := anchor(ctx, tokenRequest)
 			if err != nil {
 				return response{}, err
 			}
-			tokenRequest := n.request("token")
-			tokenRequest.MachineID = target.MachineID
-			token, err := n.anchor(ctx, tokenRequest)
-			if err != nil {
-				return response{}, err
+			if token.Token == "" {
+				return response{}, errors.New("anchor did not return a join token")
 			}
 			req.Token = token.Token
 		}
-	default:
-		return response{}, errors.New("role must be bootstrap, server or agent")
 	}
-	local, err := n.target(ctx, req)
+	local, err := callWithRetry(ctx, target, req)
 	if err != nil {
 		return response{}, err
 	}
+	if local.MachineID == "" {
+		return response{}, errors.New("target did not report its machine identity")
+	}
 	observation := n.request("observe")
 	observation.MachineID = local.MachineID
-	wait, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	wait, cancel := context.WithTimeout(ctx, n.readinessTimeout())
 	defer cancel()
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
 	for {
-		result, err := n.anchor(wait, observation)
+		result, err := anchor(wait, observation)
 		if err == nil && result.Ready && result.UID != "" && result.ClusterUID != "" &&
 			(req.ClusterUID == "" || result.ClusterUID == req.ClusterUID) &&
 			(req.UID == "" || result.UID == req.UID) {
-			localCheck := n.request("local")
-			active, localErr := n.target(wait, localCheck)
+			active, localErr := target(wait, n.request("local"))
 			if localErr == nil && active.MachineID == observation.MachineID {
-				seal := req
-				seal.Operation, seal.ClusterUID, seal.UID, seal.Token = "seal", result.ClusterUID, result.UID, ""
-				if _, err := n.target(wait, seal); err != nil {
+				seal := n.request("seal")
+				seal.ClusterUID, seal.UID = result.ClusterUID, result.UID
+				if _, err := callWithRetry(ctx, target, seal); err != nil {
 					return response{}, err
 				}
 				return result, nil
 			}
 		}
+		timer := time.NewTimer(5*time.Second + time.Duration(rand.IntN(2000))*time.Millisecond)
 		select {
 		case <-wait.Done():
+			timer.Stop()
+			if err != nil {
+				return response{}, fmt.Errorf("node did not reach verified readiness: %w", err)
+			}
 			return response{}, errors.New("node did not reach verified readiness")
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }
@@ -198,9 +284,9 @@ func remove(ctx context.Context, n node) error {
 	if n.Role.ValueString() != "agent" {
 		return errors.New("control-plane removal requires operator-led quorum and datastore maintenance")
 	}
-	if _, err := n.target(ctx, n.request("stop")); err != nil {
+	if _, err := callWithRetry(ctx, n.target, n.request("stop")); err != nil {
 		return err
 	}
-	_, err := n.anchor(ctx, n.request("remove"))
+	_, err := callWithRetry(ctx, n.anchor, n.request("remove"))
 	return err
 }

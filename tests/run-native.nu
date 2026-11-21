@@ -25,6 +25,21 @@ def main [] {
         $env.TF_CLI_CONFIG_FILE = $rc
         ^$terraform $"-chdir=($work)" init -no-color
         ^$terraform $"-chdir=($work)" test -no-color
+        $env.TF_VAR_bootstrap_host = "192.0.2.10:22"
+        $env.TF_VAR_bootstrap_pin = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        for scenario in [
+            {env: {TF_VAR_role: "primary"}, expected: "Use bootstrap, server, or agent."}
+            {env: {TF_VAR_cluster_uid: "existing-cluster"}, expected: "Bootstrap field must be omitted"}
+            {env: {TF_VAR_bootstrap_pin: "SHA256:bad"}, expected: "Use the unpadded OpenSSH SHA256 fingerprint."}
+        ] {
+            let result = (with-env $scenario.env {
+                ^$terraform $"-chdir=($work)" plan -no-color | complete
+            })
+            if $result.exit_code == 0 or not ($result.stderr | str contains $scenario.expected) {
+                error make {msg: $"Expected Terraform plan to reject invalid configuration: ($scenario.expected)"}
+            }
+        }
+        print "Invalid configuration plans were rejected"
     } catch {|err|
         rm -rf $work
         error make {msg: $err.msg}

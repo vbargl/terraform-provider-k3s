@@ -20,7 +20,7 @@ resource "k3s_node" "member" {
     worker = { role = "agent", host = "${var.worker_address}:${var.ssh_port}", pin = var.worker_pin }
   }
   reconcile_revision = each.key == "worker" ? var.worker_revision : 0
-  name               = each.key
+  name               = each.key == "worker" ? var.worker_name : each.key
   role               = each.value.role
   host               = each.value.host
   host_key_sha256    = each.value.pin
@@ -66,4 +66,9 @@ variable "ssh_port" {
 variable "worker_revision" {
   type    = number
   default = 0
+}
+
+variable "worker_name" {
+  type    = string
+  default = "worker"
 }

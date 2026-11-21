@@ -16,8 +16,19 @@ variable "bootstrap_pin" {
 
 resource "k3s_node" "bootstrap" {
   name            = "bootstrap"
-  role            = "bootstrap"
+  role            = var.role
   host            = var.bootstrap_host
   host_key_sha256 = var.bootstrap_pin
   ssh_user        = "k3s-coordinator"
+  cluster_uid     = var.cluster_uid
+}
+
+variable "role" {
+  type    = string
+  default = "bootstrap"
+}
+
+variable "cluster_uid" {
+  type    = string
+  default = null
 }

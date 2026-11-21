@@ -38,6 +38,16 @@ name, init, server, token or data directory. Disable HTTP request or response
 body logging and avoid verbose service tracing. The runtime config directory
 must never be a Nix store path or be collected by configuration management.
 
+Local operations use an exclusive intent lock with a five-second wait.
+Anchor observation, token issuance and Kubernetes deletion use the cluster
+API without taking that lock. Remote commands have a 12-second timeout
+inside a host deadline of 50 seconds for API operations and 55 seconds for
+local operations, followed by up to five seconds for forced termination.
+The provider budgets up to 20 seconds for SSH setup and 65 seconds
+for the remote operation. A worker stop waits for systemd to report the service inactive or
+failed before the provider attempts node deletion. A timed-out stop keeps the
+retirement marker and can be retried.
+
 ## Recovery and rotation
 
 Snapshot embedded etcd using K3s tooling and store the corresponding server

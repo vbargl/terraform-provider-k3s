@@ -18,21 +18,37 @@ reachable from the joining nodes.
 - `host` and `host_key_sha256` specify the management host and port and its
   verified Ed25519 SSH host-key fingerprint.
 - `ssh_user` is the provisioned restricted SSH account on the node and anchor.
+- `ssh_identity_sha256` optionally selects the client key by its public
+  OpenSSH SHA256 fingerprint. This is useful when the SSH agent holds several
+  keys. It applies to both the target and anchor.
 - `registration_url` is the private HTTPS origin served by the cluster.
 - `anchor_host` and `anchor_key_sha256` identify a pinned, ready K3s server
   for cluster operations.
 - `cluster_uid` is the kube-system namespace UID. Reference the bootstrap
   resource attribute from joining resources. Bootstrap computes this value.
+- `readiness_timeout_seconds` sets the readiness deadline after the host
+  accepts a start request. It defaults to 300 seconds and accepts 30–3600.
 - `reconcile_revision` is an optional integer. Change it to request another
   apply on a tracked node, such as after correcting a stopped service.
 
-Bootstrap omits the registration and anchor fields. The provider reports the
+Bootstrap omits the registration URL, anchor fields and cluster UID. Existing
+enrollments keep their recorded name, role, registration URL and cluster UID.
+To change enrollment, add a separate node or follow the retirement procedure
+before enrolling a reprovisioned host. A forced Terraform replacement on a
+retired host requires operator recovery. SSH endpoints and fingerprints can
+be updated independently for the same enrolled host. The provider reports the
 Kubernetes Node UID as `id` and verified API and node health as `ready`.
-Plan and refresh never request a join token.
+Plan and refresh never request a join token. Refresh warns on unreachable,
+missing, replaced or unready membership and retains the original binding.
 
 The host helper writes its intent before starting K3s and rejects unmanaged
 K3s data. Repeat a failed apply with the same inputs after fixing host or
-network problems. Keep the intent and K3s data together on restore. An SSH
+network problems. Apply reuses the target's existing token when possible.
+It renews an expired worker token for an unsealed, inactive enrollment. If
+an SSH failure interrupts a token request, the operator can retry the apply
+after checking connectivity. The provider avoids retrying the mint itself
+because it could have already succeeded. Keep the intent and K3s data
+together on restore. An SSH
 failure or another node appearing under the same name cannot erase Terraform
 state. On a known-good restored server, update the pinned management address
 if the original anchor becomes permanently unavailable. Recover the
@@ -45,6 +61,12 @@ explicitly clean the retired host before reuse. Destroy of a bootstrap
 node or additional server is currently blocked. Retire servers through a
 quorum-aware operator procedure and remove their Terraform bindings after
 verifying the remaining cluster.
+
+For a permanently unreachable worker, fence the old machine so that it
+cannot rejoin. Verify the cluster identity and the recorded Node UID, then
+delete that Node from a trusted server using a UID precondition. Remove the
+Terraform binding only after confirming that the intended Node is gone.
+Use a new or reprovisioned host for replacement.
 
 See the [host setup and recovery guide](https://github.com/vbargl/terraform-provider-k3s/blob/main/host/README.md)
 for required service definitions and credential handling.

@@ -47,10 +47,10 @@ def exercise [scratch: string] {
         load-env { $"TF_VAR_($name)": $value }
     }
     $env.TF_VAR_ssh_port = ($env.LAB_SSH_PORT? | default "22")
-    let bad = (with-env {TF_VAR_bootstrap_pin: "SHA256:wrong"} {
+    let bad = (with-env {TF_VAR_bootstrap_pin: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"} {
         logged $terraform bad-key.log -- apply -auto-approve -no-color
     })
-    require ($bad != 0 and (open --raw bad-key.log | str contains 'host operation "apply" failed')) "Incorrect SSH host key was not rejected as expected"
+    require ($bad != 0 and (open --raw bad-key.log | str contains 'SSH host key mismatch')) "Incorrect SSH host key was not rejected as expected"
 
     $env.TF_LOG = "TRACE"
     $env.TF_LOG_PATH = ($scratch | path join provider.log)
@@ -62,6 +62,11 @@ def exercise [scratch: string] {
     require (($initial | get values.ready) == [true true true]) "Expected three ready nodes"
     require ((logged $terraform steady.log -- plan -detailed-exitcode -out=steady.tfplan -no-color) == 0) "Expected an unchanged Terraform plan"
     ^$terraform show -json steady.tfplan | save --raw steady.json
+
+    let rename = (with-env {TF_VAR_worker_name: "renamed-worker"} {
+        logged $terraform rename.log -- plan -no-color
+    })
+    require ($rename != 0 and (open --raw rename.log | str contains "K3s enrollment cannot be changed in place")) "An enrollment rename did not fail safely at plan time"
 
     # Revoke the worker's bootstrap token and restart it with existing node credentials.
     let worker_token = (^incus exec $worker -- cat /var/lib/k3s-coordinate/join-token | str trim)
@@ -89,7 +94,7 @@ def exercise [scratch: string] {
         [$token ($token | split row "::" | last)]
     } | flatten | uniq)
     let reports = [create.tfplan steady.tfplan terraform.tfstate plan.json state.json steady.json restarted.json $env.TF_LOG_PATH]
-    scan ($reports | append [bad-key.log apply.log plan.log steady.log restart.log bootstrap-journal.log server-journal.log worker-journal.log]) $secrets
+    scan ($reports | append [bad-key.log apply.log plan.log steady.log rename.log restart.log bootstrap-journal.log server-journal.log worker-journal.log]) $secrets
     let keys = (^incus exec $bootstrap -- cat /etc/rancher/k3s/k3s.yaml | from yaml | get users.user.client-key-data)
     require (($keys | is-not-empty) and ($keys | all {|key| $key != "" })) "Missing test kubeconfig private key"
     scan $reports $keys
