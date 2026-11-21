@@ -2,8 +2,17 @@
 
 The Registry source address is `vbargl/k3s`. GoReleaser builds protocol 6
 binaries, ZIP archives and a checksum file covering the archives and versioned
-Registry manifest. The manual release-artifacts workflow uploads these unsigned
+Registry manifest. The manual Publish workflow uploads these unsigned
 artifacts for review.
+
+Dispatch the workflow on `main` with a version such as `0.1.0` and enable
+`publish` to create the matching Git tag and a GitHub Release. The job
+checks the downloaded assets against their SHA-256 sums and attaches them
+to the release. The tag targets the exact commit that built the assets.
+The workflow refuses an existing tag or release. If an interrupted upload
+leaves a draft, inspect its assets before resuming it manually.
+
+GitHub assets from this workflow are unsigned.
 
 For an approved release, verify repository eligibility, license and tag.
 Verify all artifact checksums and sign the checksum manifest with an existing
